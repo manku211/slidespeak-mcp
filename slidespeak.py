@@ -181,6 +181,80 @@ async def generate_powerpoint(plain_text: str, length: int, template: str) -> st
         logging.warning(f"Timeout ({GENERATION_TIMEOUT}s) while waiting for PowerPoint generation task {task_id}.")
         return f"Timeout while waiting for PowerPoint generation (Task ID: {task_id}). The task might still be running."
 
+@mcp.tool()
+async def generate_powerpoint_slide_by_slide(slides: List[dict], template: str) -> str:
+    """
+    Generate a PowerPoint presentation based on text, length, and template.
+    Waits up to a configured time for the result.
+    """
+    generation_endpoint = "/presentation/generate/slide-by-slide"
+    status_endpoint_base = "/task_status" # Base path for status checks
+
+    if not API_KEY:
+        return "API Key is missing. Cannot process any requests."
+
+    # Prepare the JSON body for the generation request
+    payload = {
+        "slides": slides,
+        "template": template
+    }
+
+    # Step 1: Initiate generation (POST request)
+    init_result = await _make_api_request("POST", generation_endpoint, payload=payload, timeout=GENERATION_TIMEOUT)
+
+    if not init_result:
+        return "Failed to initiate PowerPoint generation due to an API error. Check server logs."
+
+    task_id = init_result.get("task_id")
+    if not task_id:
+        return f"Failed to initiate PowerPoint generation. API response did not contain a task ID. Response: {init_result}"
+
+    logging.info(f"PowerPoint generation initiated. Task ID: {task_id}")
+
+    # Step 2: Poll for the task status
+    status_endpoint = f"{status_endpoint_base}/{task_id}"
+    start_time = time.time()
+    final_result = None
+
+    while time.time() - start_time < GENERATION_TIMEOUT:
+        logging.debug(f"Polling status for task {task_id}...")
+        status_result = await _make_api_request("GET", status_endpoint, timeout=POLLING_TIMEOUT)
+
+        if status_result:
+            task_status = status_result.get("task_status")
+            task_result = status_result.get("task_result") # Assuming result might be here
+
+            if task_status == "SUCCESS":
+                logging.info(f"Task {task_id} completed successfully.")
+                # Prefer task_result if available, otherwise return the whole status dict as string
+                final_result = str(task_result) if task_result else str(status_result)
+
+                final_result = f"Make sure to return the pptx url to the user if available. Here is the result: {final_result}"
+                break
+            elif task_status == "FAILED": # Use 'FAILED' consistently if possible in API
+                logging.error(f"Task {task_id} failed. Status response: {status_result}")
+                error_message = task_result.get("error", "Unknown error") if isinstance(task_result, dict) else "Unknown error"
+                final_result = f"PowerPoint generation failed for task {task_id}. Reason: {error_message}"
+                break
+            elif task_status == "PENDING" or task_status == "PROCESSING": # Add other intermediate states if known
+                logging.debug(f"Task {task_id} status: {task_status}. Waiting...")
+            else:
+                 logging.warning(f"Task {task_id} has unknown status: {task_status}. Response: {status_result}")
+                 # Continue polling, but log this unexpected state
+
+        else:
+            # Failure during polling
+            logging.warning(f"Failed to get status for task {task_id} during polling. Will retry.")
+            # Optionally add a counter to break after several consecutive polling failures
+
+        await asyncio.sleep(POLLING_INTERVAL) # Use asyncio.sleep in async functions
+
+    # After loop: check if we got a result or timed out
+    if final_result:
+        return final_result
+    else:
+        logging.warning(f"Timeout ({GENERATION_TIMEOUT}s) while waiting for PowerPoint generation task {task_id}.")
+        return f"Timeout while waiting for PowerPoint generation (Task ID: {task_id}). The task might still be running."
 
 if __name__ == "__main__":
     # Configure logging (optional but recommended)
