@@ -1,0 +1,142 @@
+name: Build and Deploy MCP to GKE
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deployment_name:
+        description: 'Deployment Name'
+        required: true
+        default: 'slidespeak-mcp'
+
+env:
+  PROJECT_ID: ${{ secrets.GKE_PROJECT }}
+  GKE_CLUSTER: ruh-ai-dev-cluster   # Add your cluster name here
+  GKE_ZONE: us-central1  # Add your cluster zone here
+  DEPLOYMENT_NAME: ${{ github.event.inputs.deployment_name || 'slidespeak-mcp' }}
+  MCP_IMAGE_NAME: slidespeak-mcp
+  REPOSITORY: mcp-server  # Artifact Registry repository name
+  REGION: us-central1      # Artifact Registry region
+
+jobs:
+  setup-build-publish-deploy:
+    name: Setup, Build, Publish, and Deploy
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    # Setup gcloud CLI
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GKE_SA_KEY }}
+
+    # # Create Artifact Registry repository if it doesn't exist
+    # - name: Create Artifact Registry Repository
+    #   run: |-
+    #     gcloud artifacts repositories create $REPOSITORY \
+    #       --repository-format=docker \
+    #       --location=$REGION \
+    #       --description="MCP Server images repository" \
+    #       --quiet || true
+
+    # Configure Docker to use the gcloud command-line tool as a credential helper for Artifact Registry
+    - run: |-
+        gcloud --quiet auth configure-docker $REGION-docker.pkg.dev
+
+    # Get the GKE credentials so we can deploy to the cluster
+    - name: Get GKE Credentials
+      uses: google-github-actions/get-gke-credentials@v2
+      with:
+        cluster_name: ${{ env.GKE_CLUSTER }}
+        location: ${{ env.GKE_ZONE }}
+
+    # Build the Docker image for MCP server
+    - name: Build MCP Server Image
+      run: |-
+        docker build \
+          --no-cache \
+          --tag "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$MCP_IMAGE_NAME:${GITHUB_REF_NAME}-${GITHUB_SHA::7}" \
+          --build-arg GITHUB_SHA="$GITHUB_SHA" \
+          --build-arg GITHUB_REF="$GITHUB_REF" \
+          .
+
+    # Push the Docker image to Google Artifact Registry
+    - name: Publish MCP Server Image
+      run: |-
+        docker push "$REGION-docker.pkg.dev/$PROJECT_ID/$REPOSITORY/$MCP_IMAGE_NAME:${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+
+    # Create deployment manifest
+    - name: Create deployment manifest
+      run: |
+        cat > k8s-manifest.yaml << 'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${{ env.DEPLOYMENT_NAME }}
+          labels:
+            app: ${{ env.DEPLOYMENT_NAME }}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: ${{ env.DEPLOYMENT_NAME }}
+          template:
+            metadata:
+              labels:
+                app: ${{ env.DEPLOYMENT_NAME }}
+            spec:
+              containers:
+              # MCP Server (stdio) - using the image we just built and pushed to GCR
+              - name: mcp-server
+                image: ${{ env.REGION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.MCP_IMAGE_NAME }}:$GITHUB_REF_NAME-${GITHUB_SHA::7}
+                ports:
+                - containerPort: 8080
+                  protocol: TCP
+                # Keep their original command/entrypoint
+                # The container runs normally with stdio
+                env:
+                - name: GITHUB_TOKEN
+                  valueFrom:
+                    secretKeyRef:
+                      name: mcp-secrets
+                      key: github-token
+                      optional: true
+                resources:
+                  requests:
+                    memory: "256Mi"
+                    cpu: "250m"
+                  limits:
+                    memory: "512Mi"
+                    cpu: "500m"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${{ env.DEPLOYMENT_NAME }}-service
+        spec:
+          selector:
+            app: ${{ env.DEPLOYMENT_NAME }}
+          ports:
+          - name: http
+            port: 80
+            targetPort: 8080
+          type: LoadBalancer
+        EOF
+
+
+    # Deploy to GKE
+    - name: Deploy
+      run: |-
+        kubectl apply -f k8s-manifest.yaml
+        kubectl rollout status deployment/${{ env.DEPLOYMENT_NAME }}
+        kubectl get services -o wide
