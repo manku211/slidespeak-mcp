@@ -78,11 +78,12 @@ jobs:
     # Create deployment manifest
     - name: Create deployment manifest
       run: |
-        cat > k8s-manifest.yaml << 'EOF'
+        cat > k8s-manifest.yaml << EOF
         apiVersion: apps/v1
         kind: Deployment
         metadata:
           name: ${{ env.DEPLOYMENT_NAME }}
+          namespace: mcp-servers
           labels:
             app: ${{ env.DEPLOYMENT_NAME }}
         spec:
@@ -123,6 +124,7 @@ jobs:
         kind: Service
         metadata:
           name: ${{ env.DEPLOYMENT_NAME }}-service
+          namespace: mcp-servers
         spec:
           selector:
             app: ${{ env.DEPLOYMENT_NAME }}
